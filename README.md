@@ -12,12 +12,14 @@ The script depends on the following R packages:
 - `mlbench`
 - `caret`
 - `PROC`
-- `pROC`
+- `PRROC`
 - `e1071`
 - `tibble`
 - `forcats`
 - `doParallel`
+- `iterators`
 - `readxl`
+- `tictoc`
 
 Ensure these packages are installed and loaded as shown in the script.
 
