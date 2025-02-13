@@ -1,0 +1,532 @@
+---
+title: "Model Building"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+##### Done By: Putri Nur Fatin
+
+### Script Purpose: Model Building using LR Features with ROSE balancing data
+
+```{r}
+rm(list = ls()) # clear workspace
+current_working_dir <- dirname(rstudioapi::getActiveDocumentContext()$path) 
+setwd(current_working_dir) #set current directory to source file location
+```
+
+```{r}
+# PACKAGES
+library(mlbench) #for ML models
+library(caret) #for ML models
+library(pROC) #for ROC plot
+library(PRROC) #for PR Curve
+library(e1071) #for confusion matrix
+library(tibble) #for data manipulation
+library(forcats) #for data manipulation
+library(readxl) # read excel file
+library(doParallel) #for parallel computing
+library(foreach) #for parallel computing
+library(iterators) #for parallel computing
+library(tictoc) #time keeping
+```
+
+### STEP 1 - Load Data
+
+```{r}
+# Load features metadata
+allMeta_list <- read.csv("features_REDISCOVER_sel30.csv",
+                         header = T)
+allMeta_sel_list<- allMeta_list[which(allMeta_list$lr_fet %in% c("yes")),] 
+feats_sel_list <- allMeta_sel_list$Variables[which(allMeta_sel_list$Types == "features")]
+feats_sel_list
+```
+
+```{r}
+# Load the data
+train_data_ALL <- read.csv("train_data.csv", header = T)
+test_data_ALL <- read.csv("test_data.csv", header = T)
+```
+
+```{r}
+# Extract relevant features and outcome 
+train_data <- train_data_ALL[,c(feats_sel_list,"outcome_CVD_General")]
+test_data <- test_data_ALL[,c(feats_sel_list,"outcome_CVD_General")]
+otherScore_train_data <- data.frame(FRS_score = train_data_ALL$FRS_score,
+                                   RPCE_score = train_data_ALL$RPCE_score)
+otherScore_test_data <- data.frame(FRS_score = test_data_ALL$FRS_score,
+                                   RPCE_score = test_data_ALL$RPCE_score)
+```
+
+### STEP 2 - Data Preprocessing
+
+```{r}
+# Change categorical non-binary features to factors
+cat_nb_fet <- allMeta_sel_list$Variables[which(allMeta_sel_list$Cat_Cont_Ord %in% c("categorical_nonBinary", "ordinal"))]
+
+length(cat_nb_fet)
+if (length(cat_nb_fet) == 1) {
+  # Handle single non-binary feature
+  common_levels <- intersect(levels(as.factor(train_data[[cat_nb_fet]])), levels(as.factor(test_data[[cat_nb_fet]])))
+  train_data[[cat_nb_fet]] <- factor(train_data[[cat_nb_fet]], levels = common_levels)
+  test_data[[cat_nb_fet]] <- factor(test_data[[cat_nb_fet]], levels = common_levels)
+  
+} else if (length(cat_nb_fet) > 1) {
+  # Handle multiple non-binary features
+  for (col in cat_nb_fet) {
+    common_levels <- intersect(levels(as.factor(train_data[[col]])), levels(as.factor(test_data[[col]])))
+    train_data[[col]] <- factor(train_data[[col]], levels = common_levels)
+    test_data[[col]] <- factor(test_data[[col]], levels = common_levels)
+  }
+  
+} else if (length(cat_nb_fet) == 0) {
+  train_data[,cat_nb_fet] <- train_data[,cat_nb_fet]
+  test_data[,cat_nb_fet] <- test_data[,cat_nb_fet]
+}
+```
+
+```{r}
+# Change categorical binary features to 0 & 1
+cat_fet <- allMeta_sel_list$Variables[which(allMeta_sel_list$Cat_Cont_Ord == "categorical_binary")]
+
+length(cat_fet)
+if (length(cat_fet) == 1) {
+  train_data[,cat_fet] <- ifelse(train_data[,cat_fet] == 1, 1, 0)
+  train_data[,cat_fet] <- as.factor(train_data[,cat_fet])
+  
+  test_data[,cat_fet] <- ifelse(test_data[,cat_fet] == 1, 1, 0)
+  test_data[,cat_fet] <- as.factor(test_data[,cat_fet])
+} else if (length(cat_fet) > 1) {
+  train_data[,cat_fet] <- ifelse(train_data[,cat_fet] == 1, 1, 0)
+  train_data[,cat_fet] <- lapply(train_data[,cat_fet], as.factor)
+  
+  test_data[,cat_fet] <- ifelse(test_data[,cat_fet] == 1, 1, 0)
+  test_data[,cat_fet] <- lapply(test_data[,cat_fet], as.factor)
+} else if (length(cat_fet) == 0) {
+  train_data[,cat_fet] <- train_data[,cat_fet]
+  test_data[,cat_fet] <- test_data[,cat_fet]
+}
+```
+
+```{r}
+# Normalize continuous & ordinal features : Standardization (mean 0, sd 1)
+cont_fet <- allMeta_sel_list$Variables[which(allMeta_sel_list$Cat_Cont_Ord %in% c("continuous"))]
+
+length(cont_fet)
+zscore_scale <- preProcess(train_data[,cont_fet],
+                           method=c("center", "scale"))
+train_data[,cont_fet] <- predict(zscore_scale,
+                                 train_data[,cont_fet])
+test_data[,cont_fet] <- predict(zscore_scale,
+                                test_data[,cont_fet])
+```
+
+```{r}
+# Outcome
+train_data$outcome_CVD_General <- ifelse(train_data$outcome_CVD_General == 1, 
+                                         "Positive",
+                                         "Negative")
+test_data$outcome_CVD_General <- ifelse(test_data$outcome_CVD_General == 1, 
+                                        "Positive",
+                                        "Negative")
+train_data$outcome_CVD_General <- as.factor(train_data$outcome_CVD_General)
+test_data$outcome_CVD_General <- as.factor(test_data$outcome_CVD_General)
+
+summary(train_data)
+summary(test_data)
+```
+
+```{r}
+# Change the data to matrix
+X_train <- train_data[,colnames(train_data) != "outcome_CVD_General"]
+X_test <-test_data[,colnames(test_data) != "outcome_CVD_General"]
+
+Y_train <- train_data[, c("outcome_CVD_General")]
+Y_test <- test_data[,c("outcome_CVD_General")]
+
+```
+
+### STEP 3 - Individual Model Building
+
+-   Kfold Cross Validation - 5 cv
+
+-   Random search
+
+#### Individual model trained with CV
+
+```{r}
+cl <- makePSOCKcluster(detectCores() - 1)
+registerDoParallel(cl)
+```
+
+```{r}
+# Cross validation
+set.seed(333)
+fitControl <- trainControl(method = "cv",
+                           number = 5,
+                           search="random", #random search
+                           savePredictions = 'final', # To save out of fold predictions for best parameter combinantions
+                           classProbs = T, # To save the class probabilities of the out of fold predictions
+                           summaryFunction = twoClassSummary,
+                           index = createFolds(train_data$outcome_CVD_General,5),
+                           allowParallel = T)
+```
+
+-   Define model specification
+
+```{r}
+modelSpecs <- list(
+    LR = list(method = "glmnet", family = "binomial"),
+    SVMLinear = list(method = "svmLinear"),
+    SVMRadial = list(method = "svmRadial"),
+    RF = list(method = "ranger", num.trees = 250),
+    XGBoost = list(method = "xgbTree"),
+    NaiveBayes = list(method = "naive_bayes"),
+    NeuralNetwork = list(method = "nnet")
+)
+modelNames <- names(modelSpecs)
+```
+
+-   Train the model with Kfold data (used for generating train set for meta model)
+
+```{r}
+tic()
+modelIndi <- foreach(spec = modelSpecs, 
+                     .combine = c, 
+                     .packages = "caret") %dopar% {
+
+                       model <- do.call(train, c(
+                         list(outcome_CVD_General ~ .,
+                              data = train_data, 
+                              method = spec$method,
+                              metric = "ROC", 
+                              trControl = fitControl, 
+                              tuneLength = 10),
+                         spec[!names(spec) %in% c("method")]))
+        
+                       list(model)
+                     }
+names(modelIndi) <- modelNames
+
+beepr::beep()
+saveRDS(modelIndi,"modelIndi.rds")
+toc()
+
+# Stop cluster
+stopCluster(cl)
+registerDoSEQ()
+```
+
+#### Individual model trained using whole training data. This model will use the best tune from the CV model
+
+```{r}
+num_cores <- detectCores() - 1
+cl <- makePSOCKcluster(num_cores) # Use makePSOCKcluster directly
+registerDoParallel(cl)
+
+set.seed(333)
+fitControl <- trainControl(classProbs = T)
+```
+
+```{r}
+tic()
+modelAll <- foreach(spec = modelSpecs, 
+                                .combine = c, 
+                                .packages = c("caret")) %dopar% {
+
+    #Set the best tune from modelIndi
+    bestTune <- modelIndi[[names(modelSpecs)[which(sapply(modelSpecs, function(x) identical(x$method, spec$method)))]]]$bestTune
+    
+    # Train model
+    model <- do.call(train, c(
+        list(outcome_CVD_General ~ ., 
+             data = train_data, 
+             method = spec$method,
+             metric = "ROC", 
+             trControl = fitControl,
+             tuneGrid = bestTune), 
+        spec[!names(spec) %in% c("method")]
+    ))
+    list(model)
+                                }
+names(modelAll) <- modelNames
+
+toc()
+# Stop cluster
+stopCluster(cl)
+registerDoSEQ()
+
+beepr::beep()
+saveRDS(modelAll,"modelAll.rds")
+```
+
+```{r}
+# Check Correlation Matrix of Accuracy
+modelAll <- readRDS("modelAll.rds")
+modelIndi <- readRDS("modelIndi.rds")
+
+modelIndiresults <- resamples(modelAll[modelNames])
+modelCor(modelIndiresults)
+dotplot(modelIndiresults)
+summary(modelIndiresults)
+```
+
+```{r}
+# Predicting the out of fold prediction probabilities for training data
+meta_train <- data.frame(outcome_CVD_General = train_data$outcome_CVD_General, row.names = rownames(train_data))
+
+meta_train[modelNames] <- lapply(modelIndi, function(model) {
+    predictions <- model$pred[order(model$pred$rowIndex), ]
+    oof_predictions <- rep(NA, nrow(train_data))
+    for (j in seq_along(model$control$indexOut)) {
+        fold_indices <- model$control$indexOut[[j]]
+        oof_predictions[fold_indices] <- predictions$Positive[predictions$Resample == paste0("Fold", j)]
+    }
+    return(oof_predictions)
+})
+```
+
+### STEP 4 - Ensemble Model Building (Stacking)
+
+```{r}
+set.seed(333)
+meta_ctrl <- trainControl(method = "cv", 
+                          number = 5, 
+                          classProbs = TRUE, 
+                          search="random", 
+                          summaryFunction = twoClassSummary)
+
+i = 1
+
+modelAll$Ensemble_GLM <- train(meta_train[,modelNames],
+                               meta_train[,"outcome_CVD_General"],
+                               method='glm',
+                               metric = 'ROC',
+                               trControl = meta_ctrl)
+sprintf("Done Model %s", i)
+i = i + 1
+
+modelAll$Ensemble_GBM <- train(meta_train[,modelNames],
+                               meta_train[,"outcome_CVD_General"],
+                               method='gbm',
+                               metric = 'ROC',
+                               verbose = F,
+                               trControl = meta_ctrl)
+sprintf("Done Model %s", i)
+i = i + 1
+
+modelAll$Ensemble_RF <- train(meta_train[,modelNames],
+                              meta_train[,"outcome_CVD_General"],
+                              method='rf',
+                              metric = 'ROC',
+                              trControl = meta_ctrl)
+sprintf("Done Model %s", i)
+i = i + 1
+
+beepr::beep()
+saveRDS(modelAll,"modelAll.rds")
+```
+
+### STEP 5 - Model Evaluation
+
+```{r}
+otherScore_names <- c("FRS_score", "RPCE_score")
+baseModel_names <- names(modelIndi)
+metaModel_names <- c("Ensemble_GLM", "Ensemble_GBM", "Ensemble_RF")
+modelNames2 <- c(modelNames, metaModel_names)
+modelNames3 <- c(modelNames, metaModel_names, otherScore_names)
+
+idx_modelBase <- 1:7
+idx_modelMeta <- 8:10
+idx_otherScore <- 11:12
+```
+
+-   Get the training data predicted probability
+
+```{r}
+pred_prob_train <- meta_train
+
+for (i in 1:length(modelNames3)) {
+  # Base model
+  if(modelNames3[i] %in% baseModel_names){
+    pred_prob_train[modelNames3[i]] <- pred_prob_train[modelNames3[i]]
+  }
+  # Meta model
+  else if (modelNames3[i] %in% metaModel_names){
+    pred_prob_train[modelNames3[i]] <- predict(modelAll[[modelNames3[i]]],
+                                               newdata = pred_prob_train[,baseModel_names],
+                                               type = "prob")[,"Positive"]
+  } 
+  # Other score
+  else {
+    # FRS
+    if(modelNames3[i] == "FRS_score"){
+      pred_prob_train[modelNames3[i]] <- otherScore_train_data$FRS_score
+    }
+    # RPCE
+    else if (modelNames3[i] == "RPCE_score"){
+      pred_prob_train[modelNames3[i]] <- otherScore_train_data$RPCE_score
+    }
+  }
+}
+```
+
+-   Get the testing data predicted probability
+
+```{r}
+#Predicting probabilities for the test data
+pred_prob_test <- vector(mode = 'list', length = length(modelNames3))
+pred_class_test <- vector(mode = 'list', length = length(modelNames3))
+names(pred_prob_test) <- modelNames3
+names(pred_class_test) <- modelNames3
+
+for (i in 1:length(pred_prob_test)) {
+  # Base model
+  if(i %in% idx_modelBase){
+    pred_prob_test[[i]] <- predict(modelAll[[i]], 
+                                         newdata = X_test, 
+                                         type = 'prob')$Positive
+    pred_class_test[[i]] <- predict(modelAll[[i]], 
+                                          newdata = X_test)
+  }
+  # Meta model
+  else if (i %in% idx_modelMeta){
+    temp_base_prob <- as.data.frame(pred_prob_test[idx_modelBase])
+    pred_prob_test[[i]] <- predict(modelAll[[i]], 
+                                         temp_base_prob,
+                                         type = 'prob')$Positive
+    pred_class_test[[i]] <- predict(modelAll[[i]],
+                                          temp_base_prob)
+  }
+  # Other risk score
+  else if (i %in% idx_otherScore){
+    #FRS
+    if(i == idx_otherScore[1]){
+      pred_prob_test[[i]] <- otherScore_test_data$FRS_score
+      pred_class_test[[i]] <- ifelse(otherScore_test_data$FRS_score >= 0.2, 
+                                     "Positive", "Negative")
+    }
+    
+    else{
+      pred_prob_test[[i]] <- otherScore_test_data$RPCE_score
+      pred_class_test[[i]] <- ifelse(otherScore_test_data$RPCE_score >= 0.075, 
+                                     "Positive", "Negative")
+    }
+  }
+}
+pred_prob_test <- as.data.frame(pred_prob_test)
+pred_class_test <- as.data.frame(pred_class_test)
+pred_prob_test$outcome_CVD_General <- Y_test
+pred_class_test$outcome_CVD_General <- Y_test
+```
+
+-   ROC Curve & AUC
+
+```{r}
+# Train data
+roc_train <- vector(mode = 'list', length = length(modelNames3))
+auc_train <- vector(mode = 'list', length = length(modelNames3))
+names(roc_train) <- modelNames3
+names(auc_train) <- modelNames3
+
+for (i in 1:length(roc_train)) {
+  roc_train[[i]] <- roc(as.factor(pred_prob_train$outcome_CVD_General),
+                       pred_prob_train[[modelNames3[i]]],
+                       levels = c("Negative", "Positive"))
+  auc_train[[i]] <- round(roc_train[[i]]$auc,3)
+}
+auc_train <- as.data.frame(auc_train)
+auc_train
+```
+
+```{r}
+# Test data
+roc_test <- vector(mode = 'list', length = length(modelNames3))
+auc_test <- vector(mode = 'list', length = length(modelNames3))
+names(roc_test) <- modelNames3
+names(auc_test) <- modelNames3
+
+for (i in 1:length(roc_test)) {
+  roc_test[[i]] <- roc(as.factor(pred_prob_test$outcome_CVD_General),
+                       pred_prob_test[[modelNames3[i]]],
+                       levels = c("Negative", "Positive"))
+  auc_test[[i]] <- round(roc_test[[i]]$auc,3)
+}
+auc_test <- as.data.frame(auc_test)
+auc_test
+
+```
+
+-   PR Curve (Precision-Recall)
+
+```{r}
+pr_curve_test <- list(pos=vector(mode = 'list', length = length(modelNames3)),
+                            neg=vector(mode = 'list', length = length(modelNames3)),
+                            auc=vector(mode = 'list', length = length(modelNames3)))
+names(pr_curve_test$pos) <- modelNames3
+names(pr_curve_test$neg) <- modelNames3
+names(pr_curve_test$auc) <- modelNames3
+
+for (i in 1:length(modelNames3)) {
+  pr_curve_test$pos[[i]] <- pred_prob_test[[modelNames3[i]]][pred_prob_test$outcome_CVD_General == "Positive"]
+  pr_curve_test$neg[[i]] <- pred_prob_test[[modelNames3[i]]][pred_prob_test$outcome_CVD_General == "Negative"]
+  pr_curve_test$auc[[i]] <- pr.curve(pr_curve_test$pos[[i]],
+                                     pr_curve_test$neg[[i]])
+}
+pr_curve_test$pos <- as.data.frame(pr_curve_test$pos)
+pr_curve_test$neg <- as.data.frame(pr_curve_test$neg)
+pr_curve_test
+
+```
+
+Confusion matrix
+
+```{r}
+cm_test <- vector(mode = 'list', length = length(modelNames3))
+names(cm_test) <- modelNames3
+for (i in 1:length(modelNames3)) {
+  cm_test[[i]] <- confusionMatrix(data = as.factor(pred_class_test[, names(pred_class_test) == 
+                                                                                 modelNames3[[i]]]),
+                                        reference = pred_class_test$outcome_CVD_General,
+                                        positive="Positive")
+}
+```
+
+Compile result
+
+```{r}
+perf_result <- vector(mode = 'list', length = length(modelNames3))
+names(perf_result) <- modelNames3
+
+for (i in 1:length(modelNames3)) {
+  perf_result[[i]] <- data.frame(
+    auc_train = paste0(auc_train[modelNames3[i]]," (", round(as.numeric(ci.auc(roc_train[[modelNames3[i]]]))[1],3)," - ", round(as.numeric(ci.auc(roc_train[[modelNames3[i]]]))[3],3),")"),
+     auc_test = paste0(auc_test[modelNames3[i]]," (", round(as.numeric(ci.auc(roc_test[[modelNames3[i]]]))[1],3)," - ", round(as.numeric(ci.auc(roc_test[[modelNames3[i]]]))[3],3),")"),
+    accuracy=paste0(round(cm_test[[modelNames3[i]]]$overall["Accuracy"],3)," (", round(cm_test[[modelNames3[i]]]$overall["AccuracyLower"],3)," - ", round(cm_test[[modelNames3[i]]]$overall["AccuracyUpper"],3),")"),
+    sensitivity=round(cm_test[[modelNames3[i]]]$byClass["Sensitivity"],3),
+    specificity=round(cm_test[[modelNames3[i]]]$byClass["Specificity"],3),
+    ppv=round(cm_test[[modelNames3[i]]]$byClass["Pos Pred Value"],3),
+    npv=round(cm_test[[modelNames3[i]]]$byClass["Neg Pred Value"],3),
+    precision=round(cm_test[[modelNames3[i]]]$byClass["Precision"],3),
+    recall=round(cm_test[[modelNames3[i]]]$byClass["Recall"],3),
+    f1score=round(cm_test[[modelNames3[i]]]$byClass["F1"],3),
+    mcnemar=round(cm_test[[modelNames3[i]]]$overall["McnemarPValue"],3),
+    bal_acc=round(cm_test[[modelNames3[i]]]$byClass["Balanced Accuracy"],3),
+    pr_auc=round(pr_curve_test$auc[[modelNames3[i]]]$auc.integral,3))
+}
+perf_result <- as.data.frame(data.table::rbindlist(perf_result))
+perf_result <- cbind(model=modelNames3, perf_result)
+perf_result
+
+```
+
+```{r}
+# Save the result
+write.csv(pred_prob_test,"resultProb.csv",row.names = F)
+write.csv(perf_result,"resultPerf.csv",row.names = F)
+
+save.image("data.RDATA")
+# load("data.RDATA")
+```
